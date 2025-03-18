@@ -32,6 +32,7 @@ import sys
 sys.path.append(os.getcwd())
 
 from tape_model import TAPEModel
+from diffusers import UNet2DModel
 
 
 logger = get_logger(__name__, log_level="INFO")
@@ -49,8 +50,8 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     return res.expand(broadcast_shape)
 
 
-class DDPMPipelineTAPE(DDPMPipeline):
-    """DDPMPipeline that uses a TAPE model instead of a UNet."""
+class DDPMPipelineGeneric(DDPMPipeline):
+    """DDPMPipeline that works with either a TAPE model or a UNet model."""
 
     @torch.no_grad()
     def __call__(
@@ -94,20 +95,34 @@ class DDPMPipelineTAPE(DDPMPipeline):
 
 
 def create_model(config):
-    """Create a TAPE model from config."""
-    model = TAPEModel(
-        sample_size=config.model.sample_size,
-        in_channels=config.model.in_channels,
-        out_channels=config.model.out_channels,
-        num_layers=config.model.num_layers,
-        latent_dim=config.model.latent_dim,
-        tape_dim=config.model.tape_dim,
-        num_latents=config.model.num_latents,
-        patch_size=config.model.patch_size,
-        num_heads=config.model.num_heads,
-        time_embedding_dim=config.model.time_embedding_dim,
-        dropout=config.model.dropout,
-    )
+    """Create either a TAPE or UNet model based on config."""
+    if config.model.name == "tape":
+        model = TAPEModel(
+            sample_size=config.model.sample_size,
+            in_channels=config.model.in_channels,
+            out_channels=config.model.out_channels,
+            num_layers=config.model.num_layers,
+            latent_dim=config.model.latent_dim,
+            tape_dim=config.model.tape_dim,
+            num_latents=config.model.num_latents,
+            patch_size=config.model.patch_size,
+            num_heads=config.model.num_heads,
+            time_embedding_dim=config.model.time_embedding_dim,
+            dropout=config.model.dropout,
+        )
+    elif config.model.name == "unet":
+        model = UNet2DModel(
+            sample_size=config.model.sample_size,
+            in_channels=config.model.in_channels,
+            out_channels=config.model.out_channels,
+            layers_per_block=config.model.layers_per_block,
+            block_out_channels=config.model.block_out_channels,
+            down_block_types=config.model.down_block_types,
+            up_block_types=config.model.up_block_types,
+        )
+    else:
+        raise ValueError(f"Unknown model type: {config.model.name}")
+        
     return model
 
 
@@ -205,13 +220,18 @@ def main(cfg: DictConfig) -> None:
 
     # Enable xformers if requested
     if cfg.train.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            logger.info("Using xFormers for memory efficient attention")
-            model.enable_xformers_memory_efficient_attention()
-        else:
-            logger.warning(
-                "xformers is not available. Make sure it is installed correctly or disable the option."
-            )
+        try:
+            from diffusers.utils.import_utils import is_xformers_available
+            if is_xformers_available():
+                logger.info("Using xFormers for memory efficient attention")
+                model.enable_xformers_memory_efficient_attention()
+            else:
+                logger.warning(
+                    "xformers is not available. Make sure it is installed correctly or disable the option."
+                )
+        except Exception as e:
+            logger.warning(f"Error enabling xformers: {e}")
+            logger.warning("Continuing without xformers.")
 
     # Set up dataset
     if cfg.train.dataset_name is not None:
@@ -239,7 +259,9 @@ def main(cfg: DictConfig) -> None:
     ])
 
     def transform_images(examples):
-        images = [augmentations(image.convert("RGB")) for image in examples["img"]] #"image" for flowers
+        # Handle different dataset structures (CIFAR-10 uses "img", flowers dataset uses "image", etc.)
+        image_key = next(key for key in examples.keys() if key in ["img", "image", "images"])
+        images = [augmentations(image.convert("RGB")) for image in examples[image_key]]
         return {"input": images}
 
     logger.info(f"Dataset size: {len(dataset)}")
@@ -265,13 +287,16 @@ def main(cfg: DictConfig) -> None:
 
     # Set up EMA model
     if hasattr(cfg, "ema") and cfg.ema.use_ema:
+        # Determine which model class to use for EMA
+        model_cls = TAPEModel if cfg.model.name == "tape" else UNet2DModel
+        
         ema_model = EMAModel(
             model.parameters(),
             decay=cfg.ema.ema_max_decay,
             use_ema_warmup=True,
             inv_gamma=cfg.ema.ema_inv_gamma,
             power=cfg.ema.ema_power,
-            model_cls=TAPEModel,
+            model_cls=model_cls,
             model_config=model.config,
         )
     else:
@@ -442,7 +467,7 @@ def main(cfg: DictConfig) -> None:
                     ema_model.store(model.parameters())
                     ema_model.copy_to(model.parameters())
 
-                pipeline = DDPMPipelineTAPE(
+                pipeline = DDPMPipelineGeneric(
                     unet=accelerator.unwrap_model(model),
                     scheduler=scheduler,
                 )
@@ -478,7 +503,7 @@ def main(cfg: DictConfig) -> None:
             # Save model
             if epoch % cfg.checkpoint.save_model_epochs == 0 or epoch == cfg.train.num_epochs - 1:
                 # Save the model
-                pipeline = DDPMPipelineTAPE(
+                pipeline = DDPMPipelineGeneric(
                     unet=accelerator.unwrap_model(model),
                     scheduler=scheduler,
                 )
