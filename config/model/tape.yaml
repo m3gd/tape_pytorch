@@ -1,0 +1,12 @@
+name: tape
+sample_size: ${train.resolution}
+in_channels: 3
+out_channels: 3
+num_layers: 4
+latent_dim: 512
+tape_dim: 256
+num_latents: 128
+patch_size: 2
+num_heads: 8
+time_embedding_dim: 512
+dropout: 0.1
