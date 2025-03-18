@@ -264,13 +264,13 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Set up EMA model
-    if hasattr(cfg, "use_ema") and cfg.use_ema:
+    if hasattr(cfg, "ema") and cfg.ema.use_ema:
         ema_model = EMAModel(
             model.parameters(),
-            decay=cfg.ema_max_decay,
+            decay=cfg.ema.ema_max_decay,
             use_ema_warmup=True,
-            inv_gamma=cfg.ema_inv_gamma,
-            power=cfg.ema_power,
+            inv_gamma=cfg.ema.ema_inv_gamma,
+            power=cfg.ema.ema_power,
             model_cls=TAPEModel,
             model_config=model.config,
         )
