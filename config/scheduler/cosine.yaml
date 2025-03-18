@@ -1,2 +1,2 @@
 name: cosine
-lr_warmup_steps: 500
+lr_warmup_steps: 10000

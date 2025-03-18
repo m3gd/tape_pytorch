@@ -2,7 +2,7 @@ name: tape
 sample_size: ${train.resolution}
 in_channels: 3
 out_channels: 3
-num_layers: 4
+num_layers: 6
 latent_dim: 512
 tape_dim: 256
 num_latents: 128

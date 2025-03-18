@@ -26,6 +26,7 @@ import hydra
 from hydra.utils import instantiate, get_original_cwd
 from omegaconf import DictConfig
 
+from lion_pytorch import Lion
 # Add parent directory to sys.path to import the TAPE model
 import sys
 sys.path.append(os.getcwd())
@@ -187,13 +188,20 @@ def main(cfg: DictConfig) -> None:
         )
 
     # Initialize optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.optimizer.learning_rate,
-        betas=(cfg.optimizer.adam_beta1, cfg.optimizer.adam_beta2),
-        weight_decay=cfg.optimizer.adam_weight_decay,
-        eps=cfg.optimizer.adam_epsilon,
-    )
+    if cfg.optimizer.name=="adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg.optimizer.learning_rate,
+            betas=(cfg.optimizer.adam_beta1, cfg.optimizer.adam_beta2),
+            weight_decay=cfg.optimizer.adam_weight_decay,
+            eps=cfg.optimizer.adam_epsilon,
+        )
+    elif cfg.optimizer.name=="lion":
+        optimizer = Lion(
+            model.parameters(),
+            lr=cfg.optimizer.learning_rate,
+            weight_decay=cfg.optimizer.weight_decay
+        )
 
     # Enable xformers if requested
     if cfg.train.enable_xformers_memory_efficient_attention:
