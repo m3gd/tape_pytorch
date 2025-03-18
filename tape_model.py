@@ -212,9 +212,11 @@ class TAPEBlock(nn.Module):
         latent_dim,
         num_heads=8,
         time_cond_dim=None,
-        dropout=0.0
+        dropout=0.0,
+        num_layers=1,
     ):
         super().__init__()
+        self.num_layers=num_layers
         self.peg = PEG(dim)
 
         # Latents attend to tape
@@ -270,10 +272,11 @@ class TAPEBlock(nn.Module):
         latents = latents + self.latent_self_ff(latents, time)
 
         # Tape self attention
-        tape_residual = tape
-        tape = self.norm_tape_1(tape)
-        tape = tape_residual + self.tape_self_attn(tape, time=time)
-        tape = tape + self.tape_self_ff(tape, time)
+        for _ in range(self.num_layers):
+            tape_residual = tape
+            tape = self.norm_tape_1(tape)
+            tape = tape_residual + self.tape_self_attn(tape, time=time)
+            tape = tape + self.tape_self_ff(tape, time)
 
         # Tape attends to latents
         tape_residual = tape
@@ -293,7 +296,7 @@ class TAPEModel(ModelMixin, ConfigMixin):
         sample_size (int): Sample size (image size).
         in_channels (int): Number of input channels.
         out_channels (int): Number of output channels.
-        num_layers (int): Number of TAPE layers.
+        num_layers (Tuple[int]): Number of TAPE layers per block.
         latent_dim (int): Dimension of latent vectors.
         tape_dim (int): Dimension of tape vectors.
         num_latents (int): Number of latent vectors.
@@ -309,7 +312,7 @@ class TAPEModel(ModelMixin, ConfigMixin):
         sample_size: int = 64,
         in_channels: int = 3,
         out_channels: int = 3,
-        num_layers: int = 4,
+        num_layers: Tuple = (4, 4),
         latent_dim: int = 512,
         tape_dim: int = 512,
         num_latents: int = 16,
@@ -359,9 +362,10 @@ class TAPEModel(ModelMixin, ConfigMixin):
                 latent_dim=latent_dim,
                 num_heads=num_heads,
                 time_cond_dim=time_embedding_dim,
-                dropout=dropout
+                dropout=dropout,
+                num_layers=num_layers[i],
             )
-            for _ in range(num_layers)
+            for i in range(len(num_layers))
         ])
 
         # Output projection
