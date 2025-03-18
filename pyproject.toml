@@ -20,11 +20,12 @@ dependencies = [
     "wandb>=0.19.8",
     "accelerate>=1.5.2",
     "einops>=0.8.1",
-    "diffusers>=0.32.2",
+    "diffusers@git+https://github.com/huggingface/diffusers",
     "transformers>=4.49.0",
     "omegaconf>=2.3.0",
     "hydra-core>=1.3.2",
     "hydra-colorlog>=1.2.0",
+    "lion-pytorch>=0.2.3",
 ]
 [tool.uv]
 no-build-isolation-package = ["flash-attn", "torch-scatter"]
