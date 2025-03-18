@@ -1,3 +1,11 @@
+"""
+Training script for TAPE diffusion model.
+Supports both single-GPU and multi-GPU training using Accelerate.
+
+For multi-GPU training, use:
+accelerate launch --multi_gpu train_tape_diffusion.py
+"""
+
 import inspect
 import logging
 import math
@@ -11,7 +19,7 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
@@ -75,7 +83,7 @@ class DDPMPipelineTAPE(DDPMPipeline):
 
         for t in self.progress_bar(self.scheduler.timesteps):
             # 1. predict noise model_output
-            model_output = self.unet(image, t).sample
+            model_output = self.unet(image, t.to(accelerator.device)).sample
 
             # 2. compute previous image: x_t -> x_t-1
             image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
@@ -122,7 +130,13 @@ def get_scheduler_config(name):
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def main(cfg: DictConfig) -> None:
     # Initialize accelerator
-    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
+    # Initialize process group kwargs for timeout
+    process_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
+
+    # Initialize DDP kwargs for unused parameters
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=True
+    )
 
     logging_dir = os.path.join(cfg.train.output_dir, cfg.logging.logging_dir)
     accelerator_project_config = ProjectConfiguration(
@@ -135,7 +149,8 @@ def main(cfg: DictConfig) -> None:
         mixed_precision=cfg.train.mixed_precision,
         log_with=cfg.logging.logger,
         project_config=accelerator_project_config,
-        kwargs_handlers=[kwargs],
+        kwargs_handlers=[process_kwargs, ddp_kwargs],
+        split_batches=True  # Add split_batches for better multi-GPU performance
     )
 
     # Verify logger availability
@@ -292,6 +307,10 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"  Total train batch size = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {cfg.train.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {max_train_steps}")
+    logger.info(f"  Number of processes = {accelerator.num_processes}")
+    logger.info(f"  Device = {accelerator.device}")
+    if accelerator.num_processes > 1:
+        logger.info(f"  Multi-GPU training enabled with {accelerator.num_processes} GPUs")
 
     # Initialize training state
     global_step = 0
@@ -375,6 +394,9 @@ def main(cfg: DictConfig) -> None:
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
+                # Wait for all processes to sync up after optimization
+                accelerator.wait_for_everyone()
+
             # Update EMA model
             if ema_model is not None and accelerator.sync_gradients:
                 ema_model.step(model.parameters())
@@ -423,6 +445,8 @@ def main(cfg: DictConfig) -> None:
                 break
 
         progress_bar.close()
+
+        # Make sure all processes finish the epoch together
         accelerator.wait_for_everyone()
 
         # Generate sample images for visual inspection
