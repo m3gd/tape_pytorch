@@ -11,7 +11,7 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
@@ -75,7 +75,7 @@ class DDPMPipelineTAPE(DDPMPipeline):
 
         for t in self.progress_bar(self.scheduler.timesteps):
             # 1. predict noise model_output
-            model_output = self.unet(image, t).sample
+            model_output = self.unet(image, t.to(image.device)).sample
 
             # 2. compute previous image: x_t -> x_t-1
             image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
@@ -123,6 +123,7 @@ def get_scheduler_config(name):
 def main(cfg: DictConfig) -> None:
     # Initialize accelerator
     kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
     logging_dir = os.path.join(cfg.train.output_dir, cfg.logging.logging_dir)
     accelerator_project_config = ProjectConfiguration(
@@ -135,7 +136,7 @@ def main(cfg: DictConfig) -> None:
         mixed_precision=cfg.train.mixed_precision,
         log_with=cfg.logging.logger,
         project_config=accelerator_project_config,
-        kwargs_handlers=[kwargs],
+        kwargs_handlers=[kwargs, ddp_kwargs],
     )
 
     # Verify logger availability
@@ -230,7 +231,7 @@ def main(cfg: DictConfig) -> None:
     ])
 
     def transform_images(examples):
-        images = [augmentations(image.convert("RGB")) for image in examples["img"]]
+        images = [augmentations(image.convert("RGB")) for image in examples["img"]] #"image" for flowers
         return {"input": images}
 
     logger.info(f"Dataset size: {len(dataset)}")
@@ -240,7 +241,7 @@ def main(cfg: DictConfig) -> None:
         dataset,
         batch_size=cfg.train.train_batch_size,
         shuffle=True,
-        num_workers=cfg.train.num_workers
+        num_workers=cfg.train.num_workers,
     )
 
     # Create learning rate scheduler
@@ -325,7 +326,7 @@ def main(cfg: DictConfig) -> None:
     # Training loop
     for epoch in range(first_epoch, cfg.train.num_epochs):
         model.train()
-        progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
+        progress_bar = tqdm(total=num_update_steps_per_epoch // accelerator.num_processes, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
 
         for step, batch in enumerate(train_dataloader):
@@ -445,14 +446,15 @@ def main(cfg: DictConfig) -> None:
                     batch_size=cfg.train.eval_batch_size,
                     num_inference_steps=cfg.diffusion.num_inference_steps,
                     output_type="np",
-                ).sample
+                    return_dict=False,
+                )
 
                 if ema_model is not None:
                     # Restore the original model
                     ema_model.restore(model.parameters())
 
                 # Denormalize the images
-                images_processed = (images * 255).round().astype("uint8")
+                images_processed = (images[0] * 255).round().astype("uint8")
 
                 # Log images to tracker
                 if cfg.logging.logger == "tensorboard":

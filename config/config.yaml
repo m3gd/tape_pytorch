@@ -13,7 +13,7 @@ train:
   train_data_dir: null  # Set this to use local data
   cache_dir: null
   seed: 42
-  output_dir: outputs/${model.name}_${train.resolution}
+  output_dir: outputs/${model.name}-${train.dataset_name}-${train.resolution}-${now:%Y%m%d_%H%M%S}
   resolution: 32
   center_crop: false
   random_flip: true
