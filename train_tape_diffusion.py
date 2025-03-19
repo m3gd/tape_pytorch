@@ -50,6 +50,44 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
 
+def exists(x):
+    """Check if a variable exists (is not None)."""
+    return x is not None
+
+def default(val, d):
+    """Return val if it exists, otherwise return d (or call d if it's callable)."""
+    if exists(val):
+        return val
+    return d() if callable(d) else d
+
+def normalize_img_variance(x, eps=1e-5):
+    """Normalize variance of noised image, for better high-resolution training."""
+    std = torch.std(x, dim=(1, 2, 3), keepdim=True, unbiased=False)
+    return x / std.clamp(min=eps)
+
+def right_pad_dims_to(x, t):
+    """Pad dims of t to match x for broadcasting."""
+    padding_dims = x.ndim - t.ndim
+    if padding_dims <= 0:
+        return t
+    return t.view(*t.shape, *((1,) * padding_dims))
+
+def gamma_to_alpha_sigma(gamma, scale=1):
+    """Convert gamma to alpha and sigma for different noise levels."""
+    return torch.sqrt(gamma) * scale, torch.sqrt(1 - gamma)
+
+def log(t, eps=1e-20):
+    """Safe log function with minimum value."""
+    return torch.log(t.clamp(min=eps))
+
+def gamma_to_log_snr(gamma, scale=1, eps=1e-5):
+    """Convert gamma to log SNR for loss weighting."""
+    return log(gamma * (scale ** 2) / (1 - gamma), eps=eps)
+
+def safe_div(numer, denom, eps=1e-10):
+    """Safe division with small epsilon to prevent division by zero."""
+    return numer / denom.clamp(min=eps)
+
 
 class DDPMPipelineGeneric(DDPMPipeline):
     """DDPMPipeline that works with either a TAPE model or a UNet model."""
@@ -62,6 +100,9 @@ class DDPMPipelineGeneric(DDPMPipeline):
         num_inference_steps=1000,
         output_type="pil",
         return_dict=True,
+        enable_self_conditioning=True,
+        enable_variance_normalization=True,
+        variance_scale=1.0,
         **kwargs,
     ):
         # Sample noise
@@ -75,14 +116,61 @@ class DDPMPipelineGeneric(DDPMPipeline):
 
         # Set step values
         self.scheduler.set_timesteps(num_inference_steps)
+        
+        # Initialize self-conditioning
+        x_start = None
+        last_latents = None
 
         for t in self.progress_bar(self.scheduler.timesteps):
-            # 1. predict noise model_output
-            model_output = self.unet(image, t.to(image.device)).sample
-
+            # Apply variance normalization if enabled
+            if enable_variance_normalization and variance_scale < 1.0:
+                model_input = normalize_img_variance(image)
+            else:
+                model_input = image
+            
+            # Set self-conditioning if available
+            if enable_self_conditioning and hasattr(self.unet, "set_self_conditioning") and x_start is not None:
+                self.unet.set_self_conditioning(x_start, last_latents)
+            
+            # 1. predict model output
+            model_output = self.unet(model_input, t.to(image.device)).sample
+            
             # 2. compute previous image: x_t -> x_t-1
-            image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
+            step_output = self.scheduler.step(model_output, t, image, generator=generator)
+            image = step_output.prev_sample
+            
+            # Store predicted x0 for self-conditioning in the next step
+            if enable_self_conditioning:
+                # Extract the predicted x0 based on prediction type
+                if hasattr(self.scheduler.config, "prediction_type"):
+                    prediction_type = self.scheduler.config.prediction_type
+                else:
+                    prediction_type = "epsilon"  # Default for older diffusers versions
+                
+                if prediction_type == "epsilon":
+                    # For noise prediction, convert noise to x0
+                    alpha_t = self.scheduler.alphas_cumprod[t.long()]
+                    alpha_t = alpha_t.to(device=image.device)[..., None, None, None]
+                    sigma_t = torch.sqrt(1 - alpha_t)
+                    x_start = (image - sigma_t * model_output) / alpha_t.clamp(min=1e-6)
+                elif prediction_type == "sample":
+                    # Direct x0 prediction
+                    x_start = model_output
+                elif prediction_type == "v_prediction":
+                    # v-prediction, convert to x0
+                    alpha_t = self.scheduler.alphas_cumprod[t.long()]
+                    alpha_t = alpha_t.to(device=image.device)[..., None, None, None]
+                    sigma_t = torch.sqrt(1 - alpha_t)
+                    x_start = alpha_t * image - sigma_t * model_output
+                
+                # Clamp to valid image range
+                x_start = x_start.clamp(-1.0, 1.0)
+                
+                # Capture latents if model supports it
+                if hasattr(self.unet, "get_latents"):
+                    last_latents = self.unet.get_latents()
 
+        # Final image processing
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()
 
@@ -412,23 +500,104 @@ def main(cfg: DictConfig) -> None:
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             noisy_images = scheduler.add_noise(clean_images, noise, timesteps)
+            
+            # Apply variance normalization if enabled
+            if hasattr(cfg.diffusion, "variance_normalization") and cfg.diffusion.variance_normalization.enabled:
+                scale = cfg.diffusion.variance_normalization.scale
+                if scale < 1.0:
+                    noisy_images = normalize_img_variance(noisy_images)
+            
+            # Self-conditioning setup
+            x_self_cond = None
+            latent_self_cond = None
+            
+            if hasattr(cfg.diffusion, "self_conditioning") and cfg.diffusion.self_conditioning.enabled:
+                # Apply self-conditioning with probability p
+                if random.random() < cfg.diffusion.self_conditioning.probability:
+                    with torch.no_grad():
+                        # Get model prediction for conditioning
+                        model_output_for_cond = model(noisy_images, timesteps).sample
+                        
+                        # Extract alpha and sigma for the timesteps
+                        alpha_t = _extract_into_tensor(
+                            scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+                        )
+                        sigma_t = torch.sqrt(1 - alpha_t)
+                        
+                        # Compute self-conditioning based on prediction type
+                        if cfg.diffusion.prediction_type == "epsilon":
+                            x_self_cond = (noisy_images - sigma_t * model_output_for_cond) / alpha_t
+                        elif cfg.diffusion.prediction_type == "sample":
+                            x_self_cond = model_output_for_cond
+                        elif cfg.diffusion.prediction_type == "v_prediction":
+                            x_self_cond = alpha_t * noisy_images - sigma_t * model_output_for_cond
+                        
+                        # Clamp to valid image range
+                        x_self_cond = x_self_cond.clamp(-1.0, 1.0)
+                        x_self_cond = x_self_cond.detach()
+                        
+                        # For models that support latent self-conditioning
+                        if hasattr(model, "get_latents") and cfg.diffusion.self_conditioning.enable_for_latents:
+                            latent_self_cond = model.get_latents()
+                            if latent_self_cond is not None:
+                                latent_self_cond = latent_self_cond.detach()
 
             with accelerator.accumulate(model):
+                # Forward pass with self-conditioning
+                if hasattr(model, "set_self_conditioning") and x_self_cond is not None:
+                    model.set_self_conditioning(x_self_cond, latent_self_cond)
+                    
                 # Predict the noise residual
                 model_output = model(noisy_images, timesteps).sample
-
+                
+                # Compute loss based on prediction type with improved weighting
                 if cfg.diffusion.prediction_type == "epsilon":
-                    loss = F.mse_loss(model_output, noise)
+                    target = noise
                 elif cfg.diffusion.prediction_type == "sample":
+                    target = clean_images
+                elif cfg.diffusion.prediction_type == "v_prediction":
+                    # v-prediction target: alpha * noise - sigma * x_0
                     alpha_t = _extract_into_tensor(
                         scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
                     )
-                    snr_weights = alpha_t / (1 - alpha_t)
-                    # Use SNR weighting from distillation paper
-                    loss = snr_weights * F.mse_loss(model_output, clean_images, reduction="none")
-                    loss = loss.mean()
+                    sigma_t = torch.sqrt(1 - alpha_t)
+                    target = alpha_t * noise - sigma_t * clean_images
                 else:
                     raise ValueError(f"Unsupported prediction type: {cfg.diffusion.prediction_type}")
+                
+                # Calculate unweighted loss
+                loss = F.mse_loss(model_output, target, reduction="none")
+                loss = torch.mean(loss, dim=(1, 2, 3))
+                
+                # Apply loss weighting based on SNR if enabled
+                if hasattr(cfg.diffusion, "loss_weighting") and cfg.diffusion.loss_weighting.min_snr:
+                    # Extract alpha and calculate SNR
+                    alpha_t = _extract_into_tensor(
+                        scheduler.alphas_cumprod, timesteps, (clean_images.shape[0],)
+                    )
+                    sigma_t = torch.sqrt(1 - alpha_t)
+                    
+                    # Calculate signal-to-noise ratio
+                    snr = (alpha_t * alpha_t) / (sigma_t * sigma_t)
+                    
+                    # Apply min SNR clipping if enabled
+                    if cfg.diffusion.loss_weighting.min_snr:
+                        snr_gamma = cfg.diffusion.loss_weighting.min_snr_gamma
+                        snr_clipped = torch.clamp(snr, max=snr_gamma)
+                        
+                        # Different weighting schemes based on prediction type
+                        if cfg.diffusion.prediction_type == "epsilon":
+                            loss_weight = snr_clipped / snr
+                        elif cfg.diffusion.prediction_type == "sample":
+                            loss_weight = snr_clipped
+                        elif cfg.diffusion.prediction_type == "v_prediction":
+                            loss_weight = snr_clipped / (snr + 1)
+                            
+                        # Apply the weights
+                        loss = loss * loss_weight
+                
+                # Take mean over batch
+                loss = loss.mean()
 
                 accelerator.backward(loss)
 
@@ -503,6 +672,19 @@ def main(cfg: DictConfig) -> None:
                 )
 
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
+                
+                # Get variance normalization and self-conditioning settings from config
+                enable_variance_norm = False
+                variance_scale = 1.0
+                enable_self_cond = True
+                
+                if hasattr(cfg.diffusion, "variance_normalization"):
+                    enable_variance_norm = cfg.diffusion.variance_normalization.enabled
+                    variance_scale = cfg.diffusion.variance_normalization.scale
+                    
+                if hasattr(cfg.diffusion, "self_conditioning"):
+                    enable_self_cond = cfg.diffusion.self_conditioning.enabled
+                
                 # Run pipeline in inference (sample random noise and denoise)
                 images = pipeline(
                     generator=generator,
@@ -510,6 +692,9 @@ def main(cfg: DictConfig) -> None:
                     num_inference_steps=cfg.diffusion.num_inference_steps,
                     output_type="np",
                     return_dict=False,
+                    enable_self_conditioning=enable_self_cond,
+                    enable_variance_normalization=enable_variance_norm,
+                    variance_scale=variance_scale,
                 )
 
                 if ema_model is not None:

@@ -355,6 +355,19 @@ class TAPEModel(ModelMixin, ConfigMixin):
         self.tape_norm = LayerNorm(tape_dim)
         self.output_norm = LayerNorm(tape_dim)
 
+        # Support for self-conditioning
+        self.x_self_cond = None
+        self.latent_self_cond = None
+        
+        # Condition processing
+        self.init_self_cond_latents = nn.Sequential(
+            FeedForward(latent_dim),
+            LayerNorm(latent_dim)
+        )
+        
+        # Initialize with zeros to start with no conditioning effect
+        nn.init.zeros_(self.init_self_cond_latents[1].gamma)
+
         # TAPE blocks
         self.tape_blocks = nn.ModuleList([
             TAPEBlock(
@@ -370,6 +383,29 @@ class TAPEModel(ModelMixin, ConfigMixin):
 
         # Output projection
         self.to_output = nn.Linear(tape_dim, patch_size * patch_size * out_channels)
+        
+        # Store last latents for self-conditioning
+        self.last_latents = None
+
+    def set_self_conditioning(self, x_self_cond, latent_self_cond=None):
+        """
+        Set self-conditioning inputs for the next forward pass.
+        
+        Args:
+            x_self_cond (torch.FloatTensor): Self-conditioning input for image
+            latent_self_cond (torch.FloatTensor, optional): Self-conditioning for latents
+        """
+        self.x_self_cond = x_self_cond
+        self.latent_self_cond = latent_self_cond
+    
+    def get_latents(self):
+        """
+        Get the last latent values for self-conditioning.
+        
+        Returns:
+            torch.FloatTensor or None: Last latent values if available
+        """
+        return self.last_latents
 
     def forward(
         self,
@@ -408,10 +444,19 @@ class TAPEModel(ModelMixin, ConfigMixin):
 
         # Initialize latents
         latents = repeat(self.latents, '1 n d -> b n d', b=batch_size)
+        
+        # Apply latent self-conditioning if available
+        if self.latent_self_cond is not None:
+            latents = latents + self.init_self_cond_latents(self.latent_self_cond)
+            # Reset after use
+            self.latent_self_cond = None
 
         # Process through TAPE blocks
         for block in self.tape_blocks:
             x, latents = block(x, latents, time_emb)
+        
+        # Store latents for possible self-conditioning in the next step
+        self.last_latents = latents.detach()
 
         # Output projection
         x = self.output_norm(x)
