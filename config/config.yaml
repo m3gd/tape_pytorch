@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - model: tape
+  - model: rin #tape
   - optimizer: lion
   - scheduler: cosine
   - override hydra/job_logging: colorlog

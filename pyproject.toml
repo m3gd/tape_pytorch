@@ -26,6 +26,7 @@ dependencies = [
     "hydra-core>=1.3.2",
     "hydra-colorlog>=1.2.0",
     "lion-pytorch>=0.2.3",
+    "beartype>=0.20.0",
 ]
 [tool.uv]
 no-build-isolation-package = ["flash-attn", "torch-scatter"]

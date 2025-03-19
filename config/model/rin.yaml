@@ -1,0 +1,20 @@
+name: rin
+sample_size: ${train.resolution}
+in_channels: 3
+out_channels: 3
+dim: 512
+image_size: ${train.resolution}
+patch_size: 16
+depth: 6
+latent_self_attn_depth: 2
+dim_latent: 512
+num_latents: 256
+learned_sinusoidal_dim: 16
+latent_token_time_cond: false
+dual_patchnorm: false
+patches_self_attn: true
+attention:
+  heads: 8
+  dim_head: 64
+  flash: false
+  qk_norm: false

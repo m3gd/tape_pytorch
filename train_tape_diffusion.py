@@ -33,6 +33,7 @@ sys.path.append(os.getcwd())
 
 from tape_model import TAPEModel
 from diffusers import UNet2DModel
+from rin_model import RINModel
 
 
 logger = get_logger(__name__, log_level="INFO")
@@ -95,7 +96,7 @@ class DDPMPipelineGeneric(DDPMPipeline):
 
 
 def create_model(config):
-    """Create either a TAPE or UNet model based on config."""
+    """Create a model (TAPE, UNet, or RIN) based on config."""
     if config.model.name == "tape":
         model = TAPEModel(
             sample_size=config.model.sample_size,
@@ -120,9 +121,33 @@ def create_model(config):
             down_block_types=config.model.down_block_types,
             up_block_types=config.model.up_block_types,
         )
+    elif config.model.name == "rin":
+        attention_config = {
+            "heads": config.model.attention.heads,
+            "dim_head": config.model.attention.dim_head,
+            "flash": config.model.attention.flash,
+            "qk_norm": config.model.attention.qk_norm
+        }
+        model = RINModel(
+            sample_size=config.model.sample_size,
+            in_channels=config.model.in_channels,
+            out_channels=config.model.out_channels,
+            dim=config.model.dim,
+            image_size=config.model.image_size,
+            patch_size=config.model.patch_size,
+            depth=config.model.depth,
+            latent_self_attn_depth=config.model.latent_self_attn_depth,
+            dim_latent=config.model.dim_latent,
+            num_latents=config.model.num_latents,
+            learned_sinusoidal_dim=config.model.learned_sinusoidal_dim,
+            latent_token_time_cond=config.model.latent_token_time_cond,
+            dual_patchnorm=config.model.dual_patchnorm,
+            patches_self_attn=config.model.patches_self_attn,
+            attention=attention_config,
+        )
     else:
         raise ValueError(f"Unknown model type: {config.model.name}")
-        
+
     return model
 
 
@@ -288,8 +313,13 @@ def main(cfg: DictConfig) -> None:
     # Set up EMA model
     if hasattr(cfg, "ema") and cfg.ema.use_ema:
         # Determine which model class to use for EMA
-        model_cls = TAPEModel if cfg.model.name == "tape" else UNet2DModel
-        
+        if cfg.model.name == "tape":
+            model_cls = TAPEModel
+        elif cfg.model.name == "rin":
+            model_cls = RINModel
+        else:
+            model_cls = UNet2DModel
+
         ema_model = EMAModel(
             model.parameters(),
             decay=cfg.ema.ema_max_decay,
